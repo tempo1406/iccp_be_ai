@@ -1,0 +1,152 @@
+version: "3.8"
+
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.13.0
+    container_name: iccp_ai_opensearch_prod
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - ai_opensearch_data:/usr/share/opensearch/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks:
+      - ai-network
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:2.13.0
+    container_name: iccp_ai_opensearch_dashboards_prod
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    ports:
+      - "5601:5601"
+    depends_on:
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - ai-network
+
+  mongo:
+    image: mongo:7
+    container_name: iccp_ai_mongo_prod
+    env_file:
+      - .env.prod
+    ports:
+      - "27017:27017"
+    volumes:
+      - ai_mongo_data:/data/db
+    restart: always
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - ai-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: iccp_ai_redis_prod
+    volumes:
+      - ai_redis_data:/data
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ai-network
+
+  iccp-be-ai:
+    container_name: iccp-be-ai-prod
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    env_file:
+      - .env.prod
+    environment:
+      - OPENSEARCH_URL=http://opensearch:9200
+    ports:
+      - "${APP_PORT:-8001}:8001"
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    networks:
+      - ai-network
+      - iccp-network
+
+  celery-worker:
+    container_name: iccp-ai-celery-worker-prod
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    env_file:
+      - .env.prod
+    environment:
+      - OPENSEARCH_URL=http://opensearch:9200
+    command: >
+      celery -A app.workers.celery_app.celery_app worker
+      --loglevel=info
+      --queues=ingest,analytics
+      --concurrency=4
+    depends_on:
+      redis:
+        condition: service_healthy
+      mongo:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - ai-network
+      - iccp-network
+
+volumes:
+  ai_mongo_data:
+  ai_redis_data:
+  ai_opensearch_data:
+
+networks:
+  ai-network:
+    driver: bridge
+  iccp-network:
+    external: true
+    name: iccp-network

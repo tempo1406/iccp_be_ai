@@ -1,0 +1,65 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches:
+      - master
+
+jobs:
+  deploy:
+    name: SSH → VPS → git pull → docker compose up
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          port: ${{ secrets.VPS_PORT }}
+          script: |
+            set -e
+
+            echo "==> Go to iccp_backend_ai project"
+            cd /home/wyn/app/project/iccp/iccp_be_ai
+
+            echo "==> Pull latest code from GitHub"
+            git pull origin master
+
+            echo "==> Ensure shared network exists"
+            docker network inspect iccp-network >/dev/null 2>&1 || docker network create iccp-network
+
+            echo "==> Ensure mongo and redis are running"
+            docker compose --env-file .env.prod -f docker-compose.prod.yaml up -d mongo redis
+
+            echo "==> Wait for mongo to be healthy"
+            until [ "$(docker inspect --format='{{.State.Health.Status}}' iccp_ai_mongo_prod)" = "healthy" ]; do
+              echo "    mongo not ready yet, retrying in 3s..."
+              sleep 3
+            done
+            echo "    mongo is healthy!"
+
+            echo "==> Wait for redis to be healthy"
+            until [ "$(docker inspect --format='{{.State.Health.Status}}' iccp_ai_redis_prod)" = "healthy" ]; do
+              echo "    redis not ready yet, retrying in 3s..."
+              sleep 3
+            done
+            echo "    redis is healthy!"
+
+            echo "==> Build app image (no cache)"
+            docker compose --env-file .env.prod -f docker-compose.prod.yaml build --no-cache iccp-be-ai celery-worker
+
+            echo "==> Start app container"
+            docker compose --env-file .env.prod -f docker-compose.prod.yaml up -d --no-deps iccp-be-ai
+
+            echo "==> Start celery worker"
+            docker compose --env-file .env.prod -f docker-compose.prod.yaml up -d --no-deps celery-worker
+
+            echo "==> Delete old images"
+            docker image prune -f
+
+            echo "==> Deploy success!"
